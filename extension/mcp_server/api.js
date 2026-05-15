@@ -276,6 +276,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange. The join URL is returned in the response and embedded in the event description." },
+            attendees: { type: "array", items: { type: "object", properties: { email: { type: "string", description: "Attendee email address" }, name: { type: "string", description: "Display name (optional)" }, role: { type: "string", enum: ["required", "optional"], description: "Defaults to required" } }, required: ["email"] }, description: "List of attendees to invite (optional)." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -318,6 +319,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Pass an empty array to clear all categories. Use listCategories to get exact existing names." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange. Pass false to remove an existing Teams link." },
+            attendees: { type: "array", items: { type: "object", properties: { email: { type: "string", description: "Attendee email address" }, name: { type: "string", description: "Display name (optional)" }, role: { type: "string", enum: ["required", "optional"], description: "Defaults to required" } }, required: ["email"] }, description: "Replaces the full attendee list. Pass an empty array to remove all attendees." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2920,7 +2922,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence, showAs, categories, onlineMeeting) {
+            function buildAttendee(entry) {
+              const attendee = cal.createAttendee();
+              attendee.id = entry.email.includes(":") ? entry.email : `mailto:${entry.email}`;
+              if (entry.name) attendee.commonName = entry.name;
+              attendee.role = (entry.role === "optional") ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
+              attendee.participationStatus = "NEEDS-ACTION";
+              return attendee;
+            }
+
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence, showAs, categories, onlineMeeting, attendees) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -3027,6 +3038,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (categories && categories.length > 0) event.setCategories(categories);
                 if (onlineMeeting) event.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
+                if (attendees && attendees.length > 0) {
+                  for (const entry of attendees) event.addAttendee(buildAttendee(entry));
+                }
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -3591,7 +3605,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { changes };
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence, recurrenceId, showAs, categories, onlineMeeting) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence, recurrenceId, showAs, categories, onlineMeeting, attendees) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3697,6 +3711,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     newItem.deleteProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL");
                   }
                   changes.push("onlineMeeting");
+                }
+                if (attendees !== undefined) {
+                  for (const a of newItem.getAttendees()) newItem.removeAttendee(a);
+                  for (const entry of (attendees || [])) newItem.addAttendee(buildAttendee(entry));
+                  changes.push("attendees");
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -5999,11 +6018,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence, args.showAs, args.categories, args.onlineMeeting);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence, args.showAs, args.categories, args.onlineMeeting, args.attendees);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence, args.recurrenceId, args.showAs, args.categories, args.onlineMeeting);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence, args.recurrenceId, args.showAs, args.categories, args.onlineMeeting, args.attendees);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId, args.recurrenceId);
                 case "listCategories":
