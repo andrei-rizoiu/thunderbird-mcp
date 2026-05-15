@@ -3632,9 +3632,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: "endDate must be after startDate" };
                   }
 
-                  const masterClone = oldItem.clone();
-                  masterClone.recurrenceInfo.modifyException(modOcc, true);
-                  await calendar.modifyItem(masterClone, oldItem);
+                  await calendar.modifyItem(modOcc, occurrence);
                   return { success: true, updated: r.changes, mode: "occurrence", recurrenceId };
                 }
 
