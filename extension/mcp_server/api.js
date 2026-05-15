@@ -1299,6 +1299,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
             recurrence: { type: "string", description: "iCalendar RRULE string for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,TH,FR' or 'RRULE:FREQ=DAILY;COUNT=10'). The 'RRULE:' prefix is optional and added automatically if missing. FREQ=SECONDLY and FREQ=MINUTELY are rejected." },
+            attendees: { type: "array", items: { type: "object", properties: { email: { type: "string", description: "Attendee email address" }, name: { type: "string", description: "Display name (optional)" }, role: { type: "string", enum: ["required", "optional"], description: "Defaults to required" } }, required: ["email"] }, description: "List of attendees to invite (optional). On OWL/Exchange calendars, Exchange sends invitation emails when the event is created." },
             skipReview: { type: "boolean", description: "Request direct creation without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
           required: ["title", "startDate"],
@@ -1341,6 +1342,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). Pass false to remove an existing Teams link." },
             recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string (or null) to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional. FREQ=SECONDLY and FREQ=MINUTELY are rejected. Replacing the rule discards existing per-occurrence exceptions (EXDATEs / modified occurrences). Cannot be combined with recurrenceId — recurrence rules apply to the master event, not a single occurrence." },
             recurrenceId: { type: "string", description: "Optional ISO 8601 recurrence ID (from listEvents). When provided, only the matching single occurrence is modified (createException) instead of the full series. The 'recurrence' parameter must NOT be used together with recurrenceId." },
+            attendees: { type: "array", items: { type: "object", properties: { email: { type: "string", description: "Attendee email address" }, name: { type: "string", description: "Display name (optional)" }, role: { type: "string", enum: ["required", "optional"], description: "Defaults to required" } }, required: ["email"] }, description: "Replaces the full attendee list. Pass an empty array to remove all attendees; omit or pass null for no change. On OWL/Exchange, removing attendees sends cancellation emails." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2018,6 +2020,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let cal = null;
             let CalEvent = null;
             let CalTodo = null;
+            let CalAttendee = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -2031,6 +2034,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalTodo.sys.mjs"
               );
               CalTodo = CT;
+              const { CalAttendee: CA } = ChromeUtils.importESModule(
+                "resource:///modules/CalAttendee.sys.mjs"
+              );
+              CalAttendee = CA;
             } catch {
               // Calendar not available
             }
@@ -4253,7 +4260,42 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting, recurrence) {
+            function buildAttendee(entry) {
+              const attendee = new CalAttendee();
+              attendee.id = entry.email.includes(":") ? entry.email : `mailto:${entry.email}`;
+              if (entry.name) attendee.commonName = entry.name;
+              attendee.role = (entry.role === "optional") ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
+              attendee.participationStatus = "NEEDS-ACTION";
+              return attendee;
+            }
+
+            // OWL's addItem/modifyItem strip attendees unless the event's
+            // organizer.id matches the calendar's organizerId property (its
+            // heuristic for "new meeting we organise" vs "moved invitation",
+            // which Exchange doesn't support). Set both from the calendar's
+            // IMIP identity so attendees survive the OWL write path.
+            function ensureOrganizer(event, targetCalendar) {
+              if (event.getAttendees().length === 0) return;
+              try {
+                const identityKey = targetCalendar.getProperty("imip.identity.key");
+                if (!identityKey) return;
+                const identity = MailServices.accounts.getIdentity(identityKey);
+                if (!identity || !identity.email) return;
+                const organizerEmail = `mailto:${identity.email}`;
+                if (!targetCalendar.getProperty("organizerId")) {
+                  targetCalendar.setProperty("organizerId", organizerEmail);
+                }
+                const organizer = new CalAttendee();
+                organizer.id = organizerEmail;
+                organizer.commonName = identity.fullName || identity.email;
+                organizer.isOrganizer = true;
+                organizer.role = "CHAIR";
+                organizer.participationStatus = "ACCEPTED";
+                event.organizer = organizer;
+              } catch (e) { /* non-fatal: attendees may not propagate to Exchange */ }
+            }
+
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting, recurrence, attendees) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -4366,6 +4408,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: `Invalid recurrence rule: ${re.toString()}` };
                   }
                 }
+                if (attendees && attendees.length > 0) {
+                  for (const entry of attendees) event.addAttendee(buildAttendee(entry));
+                }
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -4386,6 +4431,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 event.calendar = targetCalendar;
+                ensureOrganizer(event, targetCalendar);
 
                 if (skipReview) {
                   await targetCalendar.addItem(event);
@@ -5039,7 +5085,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return {};
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurrence, recurrenceId) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurrence, recurrenceId, attendees) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -5110,6 +5156,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } catch (re) {
                     return { error: `Invalid recurrence rule: ${re.toString()}` };
                   }
+                }
+                // null is a no-op like undefined; only [] clears the list.
+                // (A null wipe would fire cancellation emails on Exchange.)
+                if (attendees !== undefined && attendees !== null) {
+                  for (const a of newItem.getAttendees()) newItem.removeAttendee(a);
+                  for (const entry of attendees) newItem.addAttendee(buildAttendee(entry));
+                  ensureOrganizer(newItem, calendar);
+                  changes.push("attendees");
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -8492,11 +8546,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.attendees);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.recurrenceId);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.recurrenceId, args.attendees);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId, args.recurrenceId);
                 case "listCategories":
