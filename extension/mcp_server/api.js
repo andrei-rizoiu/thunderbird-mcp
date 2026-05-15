@@ -3632,17 +3632,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: "endDate must be after startDate" };
                   }
 
-                  // OWL (Exchange) detects per-occurrence edits by checking recurrenceId
-                  // on the item passed to modifyItem — pass the occurrence directly.
-                  // Other providers expect the standard iCalendar approach: embed the
-                  // exception in the master's recurrenceInfo and save the master.
-                  if (calendar.type === "owl") {
-                    await calendar.modifyItem(modOcc, occurrence);
-                  } else {
-                    const masterClone = oldItem.clone();
-                    masterClone.recurrenceInfo.modifyException(modOcc, true);
-                    await calendar.modifyItem(masterClone, oldItem);
-                  }
+                  // Pass the occurrence directly — calICalendar providers handle
+                  // occurrence items via recurrenceId; modifyException+modifyItem(master)
+                  // is a workaround that breaks Exchange/OWL's occurrence detection.
+                  await calendar.modifyItem(modOcc, occurrence);
                   return { success: true, updated: r.changes, mode: "occurrence", recurrenceId };
                 }
 
