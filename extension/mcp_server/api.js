@@ -3679,6 +3679,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } catch (re) {
                     return { error: `Invalid recurrence rule: ${re.toString()}` };
                   }
+                }
                 if (categories !== undefined) {
                   newItem.setCategories(categories || []);
                   changes.push("categories");
