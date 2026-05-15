@@ -274,6 +274,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             recurrence: { type: "string", description: "iCalendar RRULE string for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,TH,FR' or 'RRULE:FREQ=DAILY;COUNT=10'). The 'RRULE:' prefix is optional and added automatically if missing." },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -314,6 +315,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional. Cannot be combined with recurrenceId — recurrence rules apply to the master event, not a single occurrence." },
             recurrenceId: { type: "string", description: "Optional ISO 8601 recurrence ID (from listEvents). When provided, only the matching single occurrence is modified (createException) instead of the full series. The 'recurrence' parameter must NOT be used together with recurrenceId." },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Pass an empty array to clear all categories. Use listCategories to get exact existing names." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2916,7 +2918,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence, showAs) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence, showAs, categories) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -3021,6 +3023,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: `Invalid recurrence rule: ${re.toString()}` };
                   }
                 }
+                if (categories && categories.length > 0) event.setCategories(categories);
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -3171,6 +3174,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // when the event has no explicit status (iCal spec treats this
                 // as implicit -- Thunderbird renders it like confirmed).
                 status: (item.getProperty("STATUS") || "").toLowerCase(),
+                categories: item.getCategories(),
                 allDay,
                 isRecurring: !!item.recurrenceInfo,
                 recurrence: extractRRuleFromItem(item),
@@ -3583,7 +3587,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { changes };
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence, recurrenceId, showAs) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence, recurrenceId, showAs, categories) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3675,6 +3679,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } catch (re) {
                     return { error: `Invalid recurrence rule: ${re.toString()}` };
                   }
+                if (categories !== undefined) {
+                  newItem.setCategories(categories || []);
+                  changes.push("categories");
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -5977,11 +5984,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence, args.showAs);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence, args.showAs, args.categories);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence, args.recurrenceId, args.showAs);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence, args.recurrenceId, args.showAs, args.categories);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId, args.recurrenceId);
                 case "listCategories":
