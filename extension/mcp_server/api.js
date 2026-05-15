@@ -273,6 +273,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             recurrence: { type: "string", description: "iCalendar RRULE string for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,TH,FR' or 'RRULE:FREQ=DAILY;COUNT=10'). The 'RRULE:' prefix is optional and added automatically if missing." },
+            showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -312,6 +313,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
             recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional. Cannot be combined with recurrenceId — recurrence rules apply to the master event, not a single occurrence." },
             recurrenceId: { type: "string", description: "Optional ISO 8601 recurrence ID (from listEvents). When provided, only the matching single occurrence is modified (createException) instead of the full series. The 'recurrence' parameter must NOT be used together with recurrenceId." },
+            showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2914,7 +2916,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence, showAs) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -3001,13 +3003,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (location) event.setProperty("LOCATION", location);
                 if (description) event.setProperty("DESCRIPTION", description);
-                if (status !== undefined && status !== null && status !== "") {
-                  const normalized = normalizeEventStatus(status);
-                  if (!normalized) {
-                    return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
-                  }
-                  event.setProperty("STATUS", normalized);
+                // STATUS: explicit param wins; otherwise derive from showAs so Thunderbird renders busy=solid, free=hatched
+                const effectiveStatus = (status !== undefined && status !== null && status !== "")
+                  ? status
+                  : (showAs === "free" ? "tentative" : "confirmed");
+                const normalizedStatus = normalizeEventStatus(effectiveStatus);
+                if (!normalizedStatus) {
+                  return { error: `Invalid status: "${effectiveStatus}". Expected tentative, confirmed, or cancelled.` };
                 }
+                event.setProperty("STATUS", normalizedStatus);
+                event.setProperty("TRANSP", showAs === "free" ? "TRANSPARENT" : "OPAQUE");
 
                 if (recurrence) {
                   try {
@@ -3578,7 +3583,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { changes };
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence, recurrenceId) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence, recurrenceId, showAs) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3645,6 +3650,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     newItem.setProperty("STATUS", normalized);
                   }
                   changes.push("status");
+                }
+                if (showAs !== undefined) {
+                  if (showAs === null || showAs === "") {
+                    newItem.deleteProperty("TRANSP");
+                  } else if (showAs === "free") {
+                    newItem.setProperty("TRANSP", "TRANSPARENT");
+                    // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
+                    if (status === undefined) { newItem.setProperty("STATUS", "TENTATIVE"); changes.push("status"); }
+                  } else if (showAs === "busy") {
+                    newItem.setProperty("TRANSP", "OPAQUE");
+                    // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
+                    if (status === undefined) { newItem.setProperty("STATUS", "CONFIRMED"); changes.push("status"); }
+                  } else {
+                    return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
+                  }
+                  changes.push("showAs");
                 }
 
                 if (recurrence !== undefined) {
@@ -5956,11 +5977,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence, args.showAs);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence, args.recurrenceId);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence, args.recurrenceId, args.showAs);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId, args.recurrenceId);
                 case "listCategories":
