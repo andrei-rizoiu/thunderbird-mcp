@@ -392,6 +392,17 @@ const sampleTools = [
     },
   },
   {
+    name: "refreshFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+        timeoutMs: { type: "integer" },
+      },
+      required: ["folderPath"],
+    },
+  },
+  {
     name: "updateMessage",
     inputSchema: {
       type: "object",
@@ -664,6 +675,65 @@ function convertProductionFileAttachments(entries, files) {
     result: runtime.filePathsToAttachDescs(entries),
   };
 }
+
+describe('Validation: refreshFolder', () => {
+  it('requires folderPath', () => {
+    const errors = validate('refreshFolder', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter/);
+    assert.match(errors[0], /folderPath/);
+  });
+
+  it('accepts a valid folderPath alone', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts a valid folderPath with integer timeoutMs', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      timeoutMs: 20000,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects number for folderPath', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects non-integer timeoutMs', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      timeoutMs: 1500.5,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string timeoutMs', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      timeoutMs: '15000',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown params', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      force: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
 
 describe('Validation: attachment sending', () => {
   it('accepts attachments as array of strings (file paths)', () => {
