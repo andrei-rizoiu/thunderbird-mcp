@@ -946,6 +946,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let cal = null;
             let CalEvent = null;
             let CalTodo = null;
+            let CalAttendee = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -959,6 +960,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalTodo.sys.mjs"
               );
               CalTodo = CT;
+              const { CalAttendee: CA } = ChromeUtils.importESModule(
+                "resource:///modules/CalAttendee.sys.mjs"
+              );
+              CalAttendee = CA;
             } catch {
               // Calendar not available
             }
@@ -2923,7 +2928,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function buildAttendee(entry) {
-              const attendee = cal.createAttendee();
+              const attendee = new CalAttendee();
               attendee.id = entry.email.includes(":") ? entry.email : `mailto:${entry.email}`;
               if (entry.name) attendee.commonName = entry.name;
               attendee.role = (entry.role === "optional") ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
@@ -3061,6 +3066,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 event.calendar = targetCalendar;
+
+                // OWL's addItem strips attendees from new events unless the event's
+                // organizer.id matches the calendar's organizerId property. It uses
+                // this check to distinguish between a new meeting the user is creating
+                // (where we ARE the organizer) vs. a Lightning invitation being moved
+                // between calendars (which Exchange doesn't support). Set both here.
+                if (event.getAttendees().length > 0) {
+                  try {
+                    const identityKey = targetCalendar.getProperty("imip.identity.key");
+                    if (identityKey) {
+                      const identity = MailServices.accounts.getIdentity(identityKey);
+                      if (identity && identity.email) {
+                        const organizerEmail = `mailto:${identity.email}`;
+                        if (!targetCalendar.getProperty("organizerId")) {
+                          targetCalendar.setProperty("organizerId", organizerEmail);
+                        }
+                        const organizer = new CalAttendee();
+                        organizer.id = organizerEmail;
+                        organizer.commonName = identity.fullName || identity.email;
+                        organizer.isOrganizer = true;
+                        organizer.role = "CHAIR";
+                        organizer.participationStatus = "ACCEPTED";
+                        event.organizer = organizer;
+                      }
+                    }
+                  } catch (e) { /* non-fatal: attendees may not propagate to Exchange */ }
+                }
 
                 if (skipReview) {
                   await targetCalendar.addItem(event);
