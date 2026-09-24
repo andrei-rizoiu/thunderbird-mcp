@@ -152,22 +152,119 @@ describe("refreshFolder", () => {
     assert.equal(f.imapUpdateCalls, 2);
   });
 
-  it("skips non-IMAP folders", async () => {
-    const local = makeFolder("mailbox://nobody@Local%20Folders/Inbox", { type: "none" });
-    const { refreshFolder } = loadRefresh({ folders: { [local.URI]: local } });
-    const res = await refreshFolder(local.URI, 5000);
-    assert.equal(res.success, true);
-    assert.match(res.skipped, /not an IMAP folder/);
+  it("skips local-store folders (Local Folders, POP, RSS, news)", async () => {
+    const folders = {};
+    for (const type of ["none", "pop3", "rss", "nntp"]) {
+      folders[`${type}://x/Inbox`] = makeFolder(`${type}://x/Inbox`, { type });
+    }
+    const { refreshFolder } = loadRefresh({ folders });
+    for (const [uri, f] of Object.entries(folders)) {
+      const res = await refreshFolder(uri, 5000);
+      assert.equal(res.success, true);
+      assert.match(res.skipped, /no server-side folder/);
+      assert.equal(f.updateCalls, 0);
+    }
   });
 
-  it("rejects unknown paths, account roots and no-select folders", async () => {
-    const root = imapFolder("imap://acct");
-    root.isServer = true;
+  it("rejects unknown paths, saved searches and no-select folders", async () => {
+    const virt = makeFolder("owl://acct/Saved", { type: "owl", flags: FLAGS.Virtual });
     const noselect = imapFolder("imap://acct/[Gmail]", { flags: FLAGS.ImapNoselect });
-    const { refreshFolder } = loadRefresh({ folders: { [root.URI]: root, [noselect.URI]: noselect } });
+    const { refreshFolder } = loadRefresh({ folders: { [virt.URI]: virt, [noselect.URI]: noselect } });
     assert.match((await refreshFolder("imap://nope", 5000)).error, /not found/);
-    assert.match((await refreshFolder(root.URI, 5000)).error, /account root/);
+    assert.match((await refreshFolder(virt.URI, 5000)).error, /virtual/);
     assert.match((await refreshFolder(noselect.URI, 5000)).error, /no-select/);
-    assert.equal(root.imapUpdateCalls + noselect.imapUpdateCalls, 0);
+    assert.equal(virt.updateCalls + noselect.imapUpdateCalls, 0);
+  });
+});
+
+describe("refreshFolder on add-on accounts (Owl)", () => {
+  // Owl folder whose updateFolder fires FolderLoaded after `delayMs`.
+  function owlFolder(uri, mailSession, { arrivals = 0, delayMs = 20, never = false, flags = 0 } = {}) {
+    const f = makeFolder(uri, { type: "owl", arrivals, flags });
+    f.updateFolder = () => {
+      f.updateCalls++;
+      if (!never) setTimeout(() => { f.complete(); mailSession.fire(f, "FolderLoaded"); }, delayMs);
+    };
+    return f;
+  }
+
+  it("waits for the folder's FolderLoaded event and removes its listener", async () => {
+    const mailSession = makeMailSession();
+    const sent = owlFolder("owl://acct/Sent", mailSession, { arrivals: 1 });
+    const { refreshFolder } = loadRefresh({ folders: { [sent.URI]: sent }, mailSession });
+    const res = await refreshFolder(sent.URI, 5000);
+    assert.equal(res.success, true);
+    assert.equal(res.status, "loaded");
+    assert.equal(res.netMessageDelta, 1);
+    assert.equal(sent.updateCalls, 1);
+    assert.equal(mailSession.listeners.size, 0);
+  });
+
+  it("ignores other folders' FolderLoaded and other events", async () => {
+    const mailSession = makeMailSession();
+    const other = makeFolder("owl://acct/Other", { type: "owl" });
+    const inbox = makeFolder("owl://acct/Inbox", { type: "owl" });
+    inbox.updateFolder = () => {
+      setTimeout(() => mailSession.fire(other, "FolderLoaded"), 5);
+      setTimeout(() => mailSession.fire(inbox, "CompactCompleted"), 10);
+      setTimeout(() => mailSession.fire(inbox, "FolderLoaded"), 40);
+    };
+    const { refreshFolder } = loadRefresh({ folders: { [inbox.URI]: inbox }, mailSession });
+    const res = await refreshFolder(inbox.URI, 5000);
+    assert.equal(res.status, "loaded");
+    assert.ok(res.elapsedMs >= 35, `settled early after ${res.elapsedMs}ms`);
+  });
+
+  it("catches a FolderLoaded fired synchronously inside updateFolder", async () => {
+    const mailSession = makeMailSession();
+    const inbox = makeFolder("owl://acct/Inbox", { type: "owl" });
+    inbox.updateFolder = () => mailSession.fire(inbox, "FolderLoaded");
+    const { refreshFolder } = loadRefresh({ folders: { [inbox.URI]: inbox }, mailSession });
+    assert.equal((await refreshFolder(inbox.URI, 5000)).status, "loaded");
+  });
+
+  it("keeps listening past a timeout; a repeat call joins and sees the end", async () => {
+    const mailSession = makeMailSession();
+    const slow = owlFolder("owl://acct/Slow", mailSession, { never: true });
+    const { refreshFolder } = loadRefresh({ folders: { [slow.URI]: slow }, mailSession });
+
+    const first = await refreshFolder(slow.URI, 1000);
+    assert.equal(first.status, "timeout");
+    assert.equal(mailSession.listeners.size, 1, "listener stays until the sync really ends");
+
+    const secondP = refreshFolder(slow.URI, 5000);
+    setTimeout(() => mailSession.fire(slow, "FolderLoaded"), 20);
+    const second = await secondP;
+    assert.equal(second.status, "loaded");
+    assert.equal(second.joinedInFlight, true);
+    assert.equal(slow.updateCalls, 1);
+    assert.equal(mailSession.listeners.size, 0);
+  });
+
+  it("account root: refreshes the Inbox and check-new folders, as Get Messages does", async () => {
+    const mailSession = makeMailSession();
+    const inbox = owlFolder("owl://acct/Inbox", mailSession, { flags: FLAGS.Inbox, arrivals: 3 });
+    const watched = owlFolder("owl://acct/Watched", mailSession, { flags: FLAGS.CheckNew });
+    const sent = owlFolder("owl://acct/Sent", mailSession, { flags: FLAGS.SentMail });
+    const root = { URI: "owl://acct", isServer: true, flags: 0, server: { type: "owl" }, descendants: [inbox, watched, sent] };
+    const { refreshFolder } = loadRefresh({ folders: { [root.URI]: root }, mailSession });
+
+    const res = await refreshFolder(root.URI, 5000);
+    assert.equal(res.success, true);
+    assert.equal(res.scope, "account");
+    // Spread into this realm: arrays built inside the vm context fail deepEqual on prototype.
+    assert.deepEqual([...res.results.map(r => r.folderPath)], [inbox.URI, watched.URI]);
+    assert.equal(res.results[0].netMessageDelta, 3);
+    assert.equal(sent.updateCalls, 0);
+  });
+
+  it("IMAP account root uses the IMAP path for its Inbox", async () => {
+    const inbox = imapFolder("imap://acct/INBOX", { flags: FLAGS.Inbox });
+    const root = { URI: "imap://acct", isServer: true, flags: 0, server: { type: "imap" }, descendants: [inbox] };
+    const { refreshFolder } = loadRefresh({ folders: { [root.URI]: root } });
+    const res = await refreshFolder(root.URI, 5000);
+    assert.equal(res.success, true);
+    assert.equal(inbox.imapUpdateCalls, 1);
+    assert.equal(inbox.updateCalls, 0);
   });
 });
