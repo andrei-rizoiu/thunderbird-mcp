@@ -2613,12 +2613,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "refreshFolder",
         group: "messages", crud: "read",
         title: "Refresh Folder",
-        description: "Fetch new mail for an IMAP folder from the server and wait for completion. Returns counts of messages before/after and how many new messages arrived. Non-IMAP folders (POP/Local) are skipped. The wait is bounded by timeoutMs (default 15000, hard-capped at 25000); on timeout the in-flight fetch keeps running in Thunderbird and a timeout result is returned.",
+        description: "Sync an IMAP folder with the server and wait for completion. Returns message and unread counts before/after, and netMessageDelta (a net count change, not a count of arrivals: an expunge or filter move can cancel out new mail). Non-IMAP folders (POP/Local) are skipped. The wait is bounded by timeoutMs; on timeout the sync keeps running in Thunderbird, a timeout result is returned, and a repeat call joins the running sync instead of starting another.",
         inputSchema: {
           type: "object",
           properties: {
-            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh" },
-            timeoutMs: { type: "integer", description: "Max ms to wait for the fetch to complete (default 15000). Hard-capped at 25000 to stay below the stdio bridge's HTTP request timeout (30000ms); larger values are clamped." },
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh. Account roots and IMAP no-select folders are rejected." },
+            timeoutMs: { type: "integer", minimum: 1000, maximum: 25000, description: "Max ms to wait for the sync to complete (default 15000). Clamped to 1000-25000 to stay below the stdio bridge's HTTP request timeout (30000ms)." },
           },
           required: ["folderPath"],
         },
@@ -10727,86 +10727,135 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            // Hard cap on the refresh wait, kept under the stdio bridge's
-            // 30000ms HTTP request timeout (5s safety margin) so a structured
-            // timeout result is returned rather than the bridge hard-failing.
-            const REFRESH_TIMEOUT_CAP_MS = 25000;
+            // refreshFolder: sync one folder with its server and wait until
+            // Thunderbird reports the pass done.
+            //
+            // IMAP drives nsIMsgImapMailFolder.updateFolderWithListener -- the
+            // targeted, waitable per-folder update. (folder.getNewMessages is
+            // the account-level Get Mail path: it updates the Inbox, so for any
+            // other folder the listener waits on the wrong work.)
+            //
+            // One sync per folder at a time: a second call joins the running
+            // one. The timeout bounds the wait, not the work -- the slot stays
+            // taken until the sync really ends (or REFRESH_ABANDON_MS passes),
+            // so repeated calls on a slow server don't stack syncs.
+            const REFRESH_DEFAULT_TIMEOUT_MS = 15000;
+            // Kept under the stdio bridge's 30000ms request timeout (5s safety
+            // margin) so a structured timeout result is returned rather than
+            // the bridge hard-failing.
+            const REFRESH_MAX_TIMEOUT_MS = 25000;
+            const REFRESH_MIN_TIMEOUT_MS = 1000;
+            const REFRESH_ABANDON_MS = 300000;
+            const refreshInFlight = new Map(); // folder URI -> completion Promise
 
-            function refreshFolder(folderPath, timeoutMs) {
-              return new Promise((resolve) => {
+            function clampRefreshTimeout(timeoutMs) {
+              const n = Number(timeoutMs);
+              if (!Number.isFinite(n) || n <= 0) return REFRESH_DEFAULT_TIMEOUT_MS;
+              return Math.min(Math.max(Math.floor(n), REFRESH_MIN_TIMEOUT_MS), REFRESH_MAX_TIMEOUT_MS);
+            }
+
+            function refreshFolderCounts(folder) {
+              try {
+                return { total: folder.getTotalMessages(false), unread: folder.getNumUnread(false) };
+              } catch {
+                return { total: null, unread: null };
+              }
+            }
+
+            function oneShotTimer(ms, callback) {
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              timer.initWithCallback({ notify: callback }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+              return timer;
+            }
+
+            // Start a sync. Returns a Promise that settles with
+            // { status: "loaded" | "error" | "abandoned", error? } when it ends.
+            function startFolderSync(folder) {
+              const uri = folder.URI;
+              const completion = new Promise(resolve => {
+                let settled = false;
+                let abandonTimer = null;
+                const settle = (outcome) => {
+                  if (settled) return;
+                  settled = true;
+                  if (abandonTimer) abandonTimer.cancel();
+                  resolve(outcome);
+                };
+                abandonTimer = oneShotTimer(REFRESH_ABANDON_MS, () => settle({ status: "abandoned" }));
                 try {
-                  const result = getAccessibleFolder(folderPath);
-                  if (result.error) {
-                    resolve({ error: result.error });
-                    return;
-                  }
-                  const folder = result.folder;
-
-                  // Non-IMAP folders (POP/Local) have no remote fetch to drive.
-                  if (!folder.server || folder.server.type !== "imap") {
-                    resolve({ success: true, folderPath: folder.URI, skipped: "not an IMAP folder" });
-                    return;
-                  }
-
-                  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0
-                    ? Math.min(Math.floor(timeoutMs), REFRESH_TIMEOUT_CAP_MS)
-                    : 15000;
-
-                  let beforeCount = null;
-                  try { beforeCount = folder.getTotalMessages(false); } catch {}
-
-                  let settled = false;
-                  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                  const settle = (value) => {
-                    if (settled) return;
-                    settled = true;
-                    try { timer.cancel(); } catch {}
-                    resolve(value);
-                  };
-
-                  // Arm the timeout BEFORE kicking off the fetch. On timeout the
-                  // in-flight getNewMessages is left running; only the wait is
-                  // abandoned.
-                  timer.initWithCallback({
-                    notify() {
-                      settle({ error: `refreshFolder timed out after ${limit}ms`, folderPath: folder.URI });
-                    }
-                  }, limit, Ci.nsITimer.TYPE_ONE_SHOT);
-
-                  const urlListener = {
+                  folder.QueryInterface(Ci.nsIMsgImapMailFolder).updateFolderWithListener(null, {
                     QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
                     OnStartRunningUrl() {},
                     OnStopRunningUrl(url, exitCode) {
-                      if (!Components.isSuccessCode(exitCode)) {
-                        // >>> 0 coerces the (negative, signed 32-bit) nsresult to
-                        // its unsigned form so the hex reads e.g. 0x80004005.
-                        settle({ error: `IMAP fetch failed (status 0x${(exitCode >>> 0).toString(16)})`, folderPath: folder.URI });
-                        return;
-                      }
-                      let afterCount = null;
-                      try { afterCount = folder.getTotalMessages(false); } catch {}
-                      const newMessages = (afterCount === null || typeof beforeCount !== "number")
-                        ? null
-                        : Math.max(0, afterCount - beforeCount);
-                      settle({
-                        success: true,
-                        folderPath: folder.URI,
-                        totalBefore: beforeCount,
-                        totalAfter: afterCount,
-                        newMessages,
-                      });
+                      // >>> 0 coerces the (negative, signed 32-bit) nsresult to
+                      // its unsigned form so the hex reads e.g. 0x80004005.
+                      settle(Components.isSuccessCode(exitCode)
+                        ? { status: "loaded" }
+                        : { status: "error", error: `IMAP update failed (status 0x${(exitCode >>> 0).toString(16)})` });
                     },
-                  };
-
-                  try {
-                    folder.getNewMessages(null, urlListener);
-                  } catch (e) {
-                    settle({ error: e.toString(), folderPath: folder.URI });
-                  }
+                  });
                 } catch (e) {
-                  resolve({ error: e.toString() });
+                  settle({ status: "error", error: String((e && e.message) || e) });
                 }
               });
+              refreshInFlight.set(uri, completion);
+              completion.then(() => refreshInFlight.delete(uri));
+              return completion;
+            }
+
+            async function syncOneFolder(folder, timeoutMs) {
+              const uri = folder.URI;
+              const started = Date.now();
+              const before = refreshFolderCounts(folder);
+              const joinedInFlight = refreshInFlight.has(uri);
+              const completion = joinedInFlight ? refreshInFlight.get(uri) : startFolderSync(folder);
+              let waitTimer = null;
+              const timedOut = new Promise(resolve => {
+                waitTimer = oneShotTimer(timeoutMs, () => resolve({
+                  status: "timeout",
+                  error: `refreshFolder timed out after ${timeoutMs}ms; the sync keeps running in the background`,
+                }));
+              });
+              const outcome = await Promise.race([completion, timedOut]);
+              waitTimer.cancel();
+              const after = refreshFolderCounts(folder);
+              const result = {
+                success: outcome.status === "loaded",
+                folderPath: uri,
+                status: outcome.status,
+                elapsedMs: Date.now() - started,
+                totalBefore: before.total,
+                totalAfter: after.total,
+                unreadBefore: before.unread,
+                unreadAfter: after.unread,
+                // A net count change, not arrivals: an expunge or a filter
+                // move can cancel out new mail.
+                netMessageDelta: (before.total !== null && after.total !== null) ? after.total - before.total : null,
+              };
+              if (joinedInFlight) result.joinedInFlight = true;
+              if (outcome.error) result.error = outcome.error;
+              return result;
+            }
+
+            async function refreshFolder(folderPath, timeoutMs) {
+              try {
+                const lookup = getAccessibleFolder(folderPath);
+                if (lookup.error) return { error: lookup.error };
+                const folder = lookup.folder;
+
+                if (!folder.server || folder.server.type !== "imap") {
+                  return { success: true, folderPath: folder.URI, skipped: "not an IMAP folder" };
+                }
+                if (folder.isServer) {
+                  return { error: `Cannot refresh an account root; pass a folder URI: ${folderPath}` };
+                }
+                if (folder.flags & Ci.nsMsgFolderFlags.ImapNoselect) {
+                  return { error: `IMAP folder cannot be selected (no-select): ${folderPath}` };
+                }
+                return await syncOneFolder(folder, clampRefreshTimeout(timeoutMs));
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             // BEGIN FILTER TOOL HANDLERS
