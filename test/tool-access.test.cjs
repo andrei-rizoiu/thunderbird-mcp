@@ -98,6 +98,7 @@ const ALL_TOOLS = [
   { name: "updateContact", group: "contacts", crud: "update" },
   { name: "deleteContact", group: "contacts", crud: "delete" },
   { name: "listCalendars", group: "calendar", crud: "read" },
+  { name: "refreshCalendar", group: "calendar", crud: "read" },
   { name: "listEvents", group: "calendar", crud: "read" },
   { name: "listCategories", group: "calendar", crud: "read" },
   { name: "createEvent", group: "calendar", crud: "create" },

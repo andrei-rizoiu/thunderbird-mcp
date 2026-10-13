@@ -148,6 +148,7 @@ New or replaced Move/Copy actions store the resolved folder's canonical URI, inc
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with disabled, read-only, event, and task support flags |
+| `refreshCalendar` | Synchronize a calendar (or every enabled refreshable calendar) with its server and wait for it to finish, like the Synchronize button, so events created or changed elsewhere become visible to `listEvents`. Uses the calendar's own refresh, so it works for Exchange/Owl, CalDAV and Google calendars. |
 | `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
 | `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
 | `updateEvent` | Modify an event or series; `recurrenceId` selects one occurrence. Meetings with other attendees are read-only while **Block `skipReview`** is on, even when `attendees` is omitted. |
