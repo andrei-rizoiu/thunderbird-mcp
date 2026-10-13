@@ -13,8 +13,13 @@ function makeCc() {
       createInstance() {
         let handle = null;
         return {
-          // unref: a sync left running on purpose must not keep node alive.
-          initWithCallback(cb, ms) { handle = setTimeout(() => cb.notify(), ms); handle.unref(); },
+          // Unref only the 5-minute abandon cap, so a sync left running on
+          // purpose does not keep node alive. The wait timer must stay ref'd:
+          // on Node 18/22 an all-unref'd loop ends and cancels the test first.
+          initWithCallback(cb, ms) {
+            handle = setTimeout(() => cb.notify(), ms);
+            if (ms >= 60000) handle.unref();
+          },
           cancel() { clearTimeout(handle); },
         };
       },
