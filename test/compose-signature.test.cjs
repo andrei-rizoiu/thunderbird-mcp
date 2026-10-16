@@ -103,6 +103,10 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
       calls.sends.push({ fields, compType, deliverMode });
       return { success: true };
     },
+    sendThroughCompose: async params => {
+      calls.sends.push({ fields: params.composeFields, compType: params.type, deliverMode: api.Ci.nsIMsgCompDeliverMode.Now });
+      return { success: true };
+    },
   });
   Object.assign(api.Cc, {
     "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },

@@ -59,9 +59,8 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     Ci: { nsIMsgCompType: { Reply: 1, ReplyAll: 2, ForwardInline: 3 }, nsIMsgCompDeliverMode: { Now: 0 }, nsIMsgFolder: {} },
     setComposeIdentity(params) { params.identity = {}; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
-    markMessageDispositionState() {},
-    async sendMessageDirectly(fields, _identity, attachments) {
-      calls.sends.push({ ...fields, attachments });
+    async sendThroughCompose(params, attachments) {
+      calls.sends.push({ ...params.composeFields, attachments });
       return { success: true };
     },
     async openComposeWindowWithCustomizations() { calls.reviews++; return { success: true }; },
